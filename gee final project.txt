@@ -1,0 +1,215 @@
+// ------------------------------
+// Bengaluru urban center geometry from GHSL dataset
+// ------------------------------
+var urbanCenters = ee.FeatureCollection('users/ujavalgandhi/e2e/ghs_urban_centers');
+var Dehradun = urbanCenters
+  .filter(ee.Filter.eq('UC_NM_MN', 'Dehradun'))
+  .filter(ee.Filter.eq('CTR_MN_NM', 'India'));
+var geometry = Dehradun.geometry();
+Map.centerObject(geometry, 10);
+
+// ------------------------------
+// Analysis years
+// ------------------------------
+var startYear = 2017;
+var endYear   = 2022;
+
+// ------------------------------
+// Dynamic World classes (correct order)
+// 0 water, 1 trees, 2 grass, 3 flooded_vegetation,
+// 4 crops, 5 shrub_and_scrub, 6 built, 7 bare, 8 snow_and_ice
+// ------------------------------
+var classIndices = [0,1,2,3,4,5,6,7]; // skipping 8 (snow/ice) in the summary loop
+var classNames = [
+  'Water','Trees','Grass','Flooded Vegetation',
+  'Crops','Shrub/Scrub','Built Area','Bare Ground'
+];
+
+// 9-class palette for visualization (DW style)
+var dwPalette = [
+  '419BDF', // water
+  '397D49', // trees
+  '88B053', // grass
+  '7A87C6', // flooded vegetation
+  'E49635', // crops
+  'DAB05D', // shrub/scrub
+  'C4281B', // built
+  'A59B8F', // bare
+  'B39FE1'  // snow/ice
+];
+
+// ------------------------------
+// SRTM for optional forest refinement (kept)
+// ------------------------------
+var dem = ee.Image('USGS/SRTMGL1_003');
+var demThreshold = 50; // meters
+
+// ------------------------------
+// Helper: get a DW composite (mode label + median probabilities) for a year
+// ------------------------------
+var dwBands = [
+  'water','trees','grass','flooded_vegetation',
+  'crops','shrub_and_scrub','built','bare','snow_and_ice'
+];
+
+function getDWComposite(year) {
+  var start = ee.Date.fromYMD(year, 1, 1);
+  var end   = start.advance(1, 'year');
+  var ic = ee.ImageCollection('GOOGLE/DYNAMICWORLD/V1')
+              .filterDate(start, end)
+              .filterBounds(geometry);
+  var labelMode = ic.select('label').mode();
+  var probsMed  = ic.select(dwBands).median();
+  return labelMode.addBands(probsMed).clip(geometry);
+}
+
+// ------------------------------
+// Load yearly composites
+// ------------------------------
+var dwStart = getDWComposite(startYear);
+var dwEnd   = getDWComposite(endYear);
+
+// ------------------------------
+// More reliable URBAN masks from 'built' probability
+// (threshold + simple de-speckling + conflict guard)
+// ------------------------------
+var builtThresh = 0.6;       // tune 0.5–0.7 if needed
+var smoothRadM  = 20;        // smoothing radius (meters), adjust 10–50
+
+function cleanUrban(img) {
+  // High built probability
+  var builtHi = img.select('built').gte(builtThresh);
+
+  // Guard against obvious confusions (stronger alt classes)
+  var altMax = img.select(['water','crops','trees','grass','flooded_vegetation','shrub_and_scrub'])
+                  .reduce(ee.Reducer.max());
+  var notAltStrong = altMax.lt(0.5);
+
+  var rawUrban = builtHi.and(notAltStrong);
+
+  // De-speckle: close small gaps & remove tiny speckles
+  var urbanSmoothed = rawUrban
+    .focal_max({radius: smoothRadM, units: 'meters'})
+    .focal_min({radius: smoothRadM, units: 'meters'})
+    .rename('urban');
+
+  return urbanSmoothed;
+}
+
+var urbanMaskStart = cleanUrban(dwStart);
+var urbanMaskEnd   = cleanUrban(dwEnd);
+
+// ------------------------------
+// Forest & Water masks (from label, as before, but correct indices)
+// ------------------------------
+var lcStart = dwStart.select('label');
+var lcEnd   = dwEnd.select('label');
+
+var forestMaskStart = lcStart.eq(1).and(dem.gt(demThreshold)); // Trees & elevation
+var forestMaskEnd   = lcEnd.eq(1).and(dem.gt(demThreshold));
+
+var waterMaskStart  = lcStart.eq(0);
+var waterMaskEnd    = lcEnd.eq(0);
+
+// ------------------------------
+// Area calculator (sq. km), robust to any mask band name
+// ------------------------------
+function calcArea(mask) {
+  var areaImg = ee.Image.pixelArea().updateMask(mask);
+  var area = ee.Number(
+    areaImg.reduceRegion({
+      reducer: ee.Reducer.sum(),
+      geometry: geometry,
+      scale: 10,
+      maxPixels: 1e9
+    }).get('area')
+  );
+  return area.divide(1e6); // sq. km
+}
+
+// ------------------------------
+// Print areas and changes
+// ------------------------------
+function printAreaChange(label, maskStart, maskEnd) {
+  var areaStart = calcArea(maskStart);
+  var areaEnd   = calcArea(maskEnd);
+  var change    = areaEnd.subtract(areaStart);
+  print(label + ' area in ' + startYear + ' (sq. km):', areaStart);
+  print(label + ' area in ' + endYear   + ' (sq. km):', areaEnd);
+  print(label + ' area change (sq. km):', change);
+}
+
+// Use the improved urban masks here:
+printAreaChange('Urban (prob-based)', urbanMaskStart, urbanMaskEnd);
+
+// Forest & Water:
+printAreaChange('Forest (Elev>50m)', forestMaskStart, forestMaskEnd);
+printAreaChange('Water', waterMaskStart, waterMaskEnd);
+
+// ------------------------------
+// Gains/Losses
+// ------------------------------
+var forestLoss = forestMaskStart.and(forestMaskEnd.not()).selfMask();
+var forestGain = forestMaskEnd.and(forestMaskStart.not()).selfMask();
+Map.addLayer(forestLoss, {palette: ['red']},   'Forest Loss');
+Map.addLayer(forestGain, {palette: ['green']}, 'Forest Gain');
+
+// Urban expansion using probability-based masks
+var newUrban = urbanMaskEnd.and(urbanMaskStart.not()).selfMask();
+Map.addLayer(newUrban, {palette: ['yellow']}, 'New Urban Area (prob-based)');
+
+// Water changes
+var newWater  = waterMaskEnd.and(waterMaskStart.not()).selfMask();
+var lostWater = waterMaskStart.and(waterMaskEnd.not()).selfMask();
+Map.addLayer(waterMaskEnd.selfMask(), {palette: ['blue']}, 'Water');
+Map.addLayer(newWater,  {palette: ['cyan']},    'New Water');
+Map.addLayer(lostWater, {palette: ['magenta']}, 'Lost Water');
+
+// ------------------------------
+// Land cover class area changes (labels), skipping Snow/Ice (8)
+// ------------------------------
+print('Land Cover Class Area Changes (sq. km) between ' + startYear + ' and ' + endYear + ':');
+classIndices.forEach(function(i) {
+  var maskStart = lcStart.eq(i);
+  var maskEnd   = lcEnd.eq(i);
+  var areaStart = calcArea(maskStart);
+  var areaEnd   = calcArea(maskEnd);
+  var change    = areaEnd.subtract(areaStart);
+  print(classNames[i] + ': Start =', areaStart, ', End =', areaEnd, ', Change =', change);
+});
+
+// ------------------------------
+// Population increase proxy: % change in URBAN (prob-based) area
+// ------------------------------
+var urbanAreaStart = calcArea(urbanMaskStart);
+var urbanAreaEnd   = calcArea(urbanMaskEnd);
+var popIncreaseProxy = urbanAreaEnd.subtract(urbanAreaStart)
+  .divide(urbanAreaStart).multiply(100);
+print('Population Increase Proxy (% increase in urban area):', popIncreaseProxy);
+
+// ------------------------------
+// Visualization: DW label layers (full 9 classes for viz correctness)
+// ------------------------------
+Map.addLayer(lcStart, {min: 0, max: 8, palette: dwPalette}, 'Land Cover ' + startYear, false);
+Map.addLayer(lcEnd,   {min: 0, max: 8, palette: dwPalette}, 'Land Cover ' + endYear,   false);
+
+// ------------------------------
+// Optional: Sentinel-2 mosaic
+// ------------------------------
+function maskS2clouds(image) {
+  var qa = image.select('QA60');
+  var cloudBitMask  = 1 << 10;
+  var cirrusBitMask = 1 << 11;
+  var mask = qa.bitwiseAnd(cloudBitMask).eq(0)
+             .and(qa.bitwiseAnd(cirrusBitMask).eq(0));
+  return image.updateMask(mask).divide(10000);
+}
+
+var s2 = ee.ImageCollection('COPERNICUS/S2_SR')
+  .filterDate(endYear + '-01-01', endYear + '-12-31')
+  .filterBounds(geometry)
+  .map(maskS2clouds)
+  .median()
+  .clip(geometry);
+
+Map.addLayer(s2, {bands: ['B4','B3','B2'], min: 0, max: 0.3}, 'Sentinel-2 Mosaic ' + endYear);
